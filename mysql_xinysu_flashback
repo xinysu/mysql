@@ -1,0 +1,439 @@
+# -*- coding: utf-8 -*-
+__author__ = 'xinysu'
+__date__ = '2017/6/15 10:30'
+
+
+
+import re
+import os
+import sys
+import datetime
+import time
+import logging
+import importlib
+importlib.reload(logging)
+logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(levelname)s %(message)s ')
+
+import pymysql
+from pymysql.cursors import DictCursor
+
+usage=''' usage: python [script's path] [option]
+ALL options need to assign:
+
+-h    : host, the database host，which database will store the results after analysis
+-u    : user, the db user
+-p    : password, the db user's password
+-P    : port, the db port
+-f    : file path, the binlog file
+-t    : table name, the table name to store the results after analysis , {dbname}.{tbname},when you want to store in `test` db and the table name is `tbevent`,then this parameter is test.tbevent
+
+-oh    : online host, the database host，which database have the online table schema
+-ou    : online user, the db user
+-op    : online password, the db user's password
+-oP    : online port, the db port
+
+-a    : action, 0 just analyse the binlog file ,and store sql in table;1 after execute self.dotype=0, execute the undo_sql in the table
+Example:
+
+'''
+
+class flashback:
+    def __init__(self):
+        self.host=''
+        self.user=''
+        self.password=''
+        self.port='3306'
+        self.fpath=''
+        self.tbevent=''
+
+        self.on_host=''
+        self.on_user=''
+        self.on_password=''
+        self.on_port='3306'
+
+        self.action=0 # 0 just analyse the binlog file ,and store sql in table;1 after execute self.dotype=0, execute the undo_sql in the table
+
+        self._get_db() # 从输入参数获取连接数据库的相关参数值
+
+        # 连接数据库，该数据库是用来存储binlog文件分析后的内容
+        logging.info('assign values to parameters is done:host={},user={},password=***,port={},fpath={},tbevent={}'.format(self.host,self.user,self.port,self.fpath,self.tbevent))
+        self.mysqlconn = pymysql.connect(host=self.host, user=self.user, password=self.password, port=self.port,charset='utf8')
+        self.cur = self.mysqlconn.cursor(cursor=DictCursor)
+        logging.info('MySQL which userd to store binlog event connection is ok')
+
+        # 连接数据库，该数据库的表结构必须跟binlogfile基于对数据库表结构一致
+        # 该数据库用于提供 binlog file 文件中涉及到表结构分析
+        logging.info('assign values to online mysql parameters is done:host={},user={},password=***,port={}'.format(self.on_host, self.on_user, self.on_port))
+        self.on_mysqlconn = pymysql.connect(host=self.on_host, user=self.on_user, password=self.on_password, port=self.on_port,charset='utf8')
+        self.on_cur = self.on_mysqlconn.cursor(cursor=DictCursor)
+        logging.info('MySQL which userd to analyse online table schema connection is ok')
+
+        logging.info('\033[33mMySQL connection is ok\033[0m')
+
+        self.dml_sql=''
+        self.undo_sql=''
+
+        self.tbfield_where = []
+        self.tbfield_set = []
+
+        self.begin_time=''
+        self.start_pos=''
+        self.db_name=''
+        self.tb_name=''
+        self.end_time=''
+        self.end_pos=''
+        self.sqltype=0
+
+    #_get_db用于获取执行命令的输入参数
+    def _get_db(self):
+        logging.info('begin to assign values to parameters')
+        if len(sys.argv) == 1:
+            print(usage)
+            sys.exit(1)
+        elif sys.argv[1] == '--help':
+            print(usage)
+            sys.exit()
+        elif len(sys.argv) > 2:
+            for i in sys.argv[1:]:
+                _argv = i.split('=')
+                if _argv[0] == '-h':
+                    self.host = _argv[1]
+                elif _argv[0] == '-u':
+                    self.user = _argv[1]
+                elif _argv[0] == '-P':
+                    self.port = int(_argv[1])
+                elif _argv[0] == '-f':
+                    self.fpath = _argv[1]
+                elif _argv[0] == '-t':
+                    self.tbevent = _argv[1]
+                elif _argv[0] == '-p':
+                    self.password = _argv[1]
+
+                elif _argv[0] == '-oh':
+                    self.on_host = _argv[1]
+                elif _argv[0] == '-ou':
+                    self.on_user = _argv[1]
+                elif _argv[0] == '-oP':
+                    self.on_port = int(_argv[1])
+                elif _argv[0] == '-op':
+                    self.on_password = _argv[1]
+
+                elif _argv[0] == '-a':
+                    self.action = _argv[1]
+
+                else:
+                    print(usage)
+
+    #创建表格，用于存储分析后的BINLOG内容
+    def create_tab(self):
+        logging.info('creating table {} to store binlog event'.format(self.tbevent))
+        create_tb_sql ='''
+        CREATE TABLE IF NOT EXISTS {}(
+            auto_id INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+            binlog_name VARCHAR(100) NOT NULL COMMENT 'the binlog file path and name',
+            dml_start_time DATETIME NOT NULL COMMENT 'when to start this transaction ',
+            dml_end_time DATETIME NOT NULL COMMENT 'when to finish this transaction ',
+            start_log_pos BIGINT NOT NULL COMMENT 'the log position for start this transaction',
+            end_log_pos BIGINT NOT NULL COMMENT 'the log position for finish this transaction',
+            db_name VARCHAR(100) NOT NULL COMMENT 'which database happened this transaction ',
+            table_name VARCHAR(200) NOT NULL COMMENT 'which table happened this transaction ',
+            sqltype INT NOT NULL COMMENT '1 is insert,2 is update,3 is delete',
+            dml_sql LONGTEXT NULL  COMMENT 'what sql excuted',
+            undo_sql LONGTEXT NULL COMMENT 'rollback sql, this sql used for flashback',
+            PRIMARY KEY (auto_id),
+            INDEX sqltype(sqltype),
+            INDEX dml_start_time (dml_start_time),
+            INDEX dml_end_time (dml_end_time),
+            INDEX start_log_pos (start_log_pos),
+            INDEX end_log_pos (end_log_pos),
+            INDEX db_name (db_name),
+            INDEX table_name (table_name)
+        )
+        COLLATE='utf8_general_ci' ENGINE=InnoDB;
+        TRUNCATE TABLE {};
+
+        '''.format(self.tbevent,self.tbevent)
+        self.cur.execute(create_tb_sql)
+        logging.info('created table {} '.format(self.tbevent))
+
+    #获取表格的列顺序对应的列名，并处理where set的时候，列与列之间的连接字符串是逗号还是 and
+    def tbschema(self,dbname,tbname):
+        self.tbfield_where = []
+        self.tbfield_set = []
+
+        sql_tb='desc {}.{}'.format(self.db_name,self.tb_name)
+
+        self.on_cur.execute(sql_tb)
+        tbcol=self.on_cur.fetchall()
+
+        i = 0
+        for l in tbcol:
+            #self.tbfield.append(l['Field'])
+            if i==0:
+                self.tbfield_where.append('`'+l['Field']+'`')
+                self.tbfield_set.append('`'+l['Field']+'`')
+                i+=1
+            else:
+                self.tbfield_where.append('/*where*/ and /*where*/' + '`'+l['Field']+'`')
+                self.tbfield_set.append( '/*set*/ , /*set*/'+'`'+l['Field']+'`' )
+
+    # 一个事务记录一行，若binlog file中的行记录包含 Table_map，则为事务的开始记录
+    def rowrecord(self,bl_line):
+        try:
+            if bl_line.find('Table_map:') != -1:
+                l = bl_line.index('server')
+                m = bl_line.index('end_log_pos')
+                n = bl_line.index('Table_map')
+                begin_time = bl_line[:l:].rstrip(' ').replace('#', '20')
+
+                self.begin_time = begin_time[0:4] + '-' + begin_time[4:6] + '-' + begin_time[6:]
+                self.start_pos = int(bl_line[m::].split(' ')[1])
+                self.db_name = bl_line[n::].split(' ')[1].replace('`', '').split('.')[0]
+                self.tb_name = bl_line[n::].split(' ')[1].replace('`', '').split('.')[1]
+
+                self.tbschema(self.db_name,self.tb_name)
+        except Exception:
+            return 'funtion rowrecord error'
+
+    def dml_tran(self,bl_line):
+        #try:
+
+
+            if bl_line.find('Xid =') != -1:
+
+                l = bl_line.index('server')
+                m = bl_line.index('end_log_pos')
+                end_time = bl_line[:l:].rstrip(' ').replace('#', '20')
+                self.end_time = end_time[0:4] + '-' + end_time[4:6] + '-' + end_time[6:]
+                self.end_pos = int(bl_line[m::].split(' ')[1])
+
+
+
+                self.undo_sql = self.dml_sql.replace(' INSERT INTO', ';DELETE FROM_su').replace(' UPDATE ',';UPDATE').replace(' DELETE FROM', ';INSERT INTO').replace(';DELETE FROM_su', ';DELETE FROM').replace('WHERE', 'WHERE_marksu').replace('SET', 'WHERE').replace('WHERE_marksu', 'SET').replace('/*set*/ , /*set*/', ' and ').replace('/*where*/ and /*where*/',' , ')
+                self.dml_sql=self.dml_sql.replace('/*set*/ , /*set*/', ' , ').replace('/*where*/ and /*where*/',' and ')
+
+                if self.dml_sql.startswith(' INSERT INTO '):
+                    self.sqltype=1
+                elif self.dml_sql.startswith(' UPDATE '):
+                    self.sqltype=2
+                elif self.dml_sql.startswith(' DELETE '):
+                    self.sqltype=3
+
+                record_sql = ''
+                undosql_desc = ''
+
+                #同个事务内部的行记录修改SQL，反序存储
+                for l in self.undo_sql.splitlines():
+                    if l.startswith(' ;UPDATE') or l.startswith(' ;INSERT') or l.startswith(' ;DELETE'):
+                        undosql_desc = record_sql + undosql_desc
+                        record_sql = ''
+                        record_sql = record_sql + l
+                    else:
+                        record_sql = record_sql + l
+
+                self.undo_sql = record_sql + undosql_desc
+                self.undo_sql = self.undo_sql.lstrip()[1:]+';'
+
+                #处理非空格的空白特殊字符
+                self.dml_sql = self.esc_code(self.dml_sql)
+                self.undo_sql = self.esc_code(self.undo_sql)
+
+                #单独处理 转移字符: \'
+                self.dml_sql = self.dml_sql.replace("'", "''").replace('\\x27',"''''")  # + ';'
+                self.undo_sql = self.undo_sql.replace("'", "''").replace('\\x27',"''''")  # + ';'
+
+                if len(self.dml_sql)>2000000:
+                    with open('/tmp/flashback_undosql/'+str(self.end_pos)+'.sql', 'w') as w_f:
+                        w_f.write('begin' + '\n')
+                        w_f.write(self.undo_sql)
+                        w_f.write('commit' + '\n')
+                    self.dml_sql=''
+                    self.undo_sql='source /tmp/flashback_undosql/'+str(self.end_pos)+'.sql'
+
+                insert_sql = "INSERT INTO {}(binlog_name,dml_start_time,dml_end_time,start_log_pos,end_log_pos,db_name,table_name,sqltype,dml_sql,undo_sql) select  '{}','{}','{}','{}','{}','{}','{}',{},'{}','{}'".format(
+                    self.tbevent, self.fpath, self.begin_time, self.end_time, self.start_pos, self.end_pos,
+                    self.db_name, self.tb_name, self.sqltype, self.dml_sql, self.undo_sql)
+
+                self.cur.execute(insert_sql)
+                self.mysqlconn.commit()
+
+                self.dml_sql = ''
+                self.undo_sql = ''
+        #except Exception:
+        #    print(self.start_pos,self.end_pos)
+        #    print(self.undo_sql)
+        #    print( 'funtion dml_tran error')
+        #    return
+
+    def analyse_binlog(self):
+        try:
+            sqlcomma=0
+            self.create_tab()
+
+            with open(self.fpath,'r') as binlog_file:
+                logging.info('\033[36mbegining to analyze the binlog file ,this may be take a long time !!!\033[0m')
+                logging.info('\033[36manalyzing...\033[0m')
+                for bline in binlog_file:
+                    if bline.find('Table_map:') != -1:
+                        self.rowrecord(bline)
+                        bline=''
+                    elif bline.rstrip()=='### SET':
+                        bline = bline[3:]
+                        sqlcomma=1
+                    elif bline.rstrip()=='### WHERE':
+                        bline = bline[3:]
+                        sqlcomma = 2
+                    elif bline.startswith('###   @'):
+                        len_f=len('###   @')
+                        i=bline[len_f:].split('=')[0]
+
+                        #处理timestamp类型
+                        if bline[8+len(i):].split(' ')[2] == 'TIMESTAMP(0)':
+                            stop_pos = bline.find(' /* TIMESTAMP(0) meta=')
+                            bline = bline.split('=')[0] + '=from_unixtime(' + bline[:stop_pos].split('=')[1] + ')'
+
+                        #处理负数存储方式
+                        if bline.split('=')[1].startswith('-'):
+                            stop_pos = bline.find(' /* TIMESTAMP(0) meta=')
+                            bline = bline.split('=')[0] + '=' + bline.split('=')[1].split(' ')[0]+'\n'
+
+                        if sqlcomma==1:
+                            bline = self.tbfield_set[int(i) - 1]+bline[(len_f+len(i)):]
+                        elif sqlcomma==2:
+                            bline = self.tbfield_where[int(i) - 1] + bline[(len_f+len(i)):]
+
+                    elif bline.startswith('### DELETE') or bline.startswith('### INSERT') or bline.startswith('### UPDATE'):
+                        bline = bline[3:]
+
+                    elif bline.find('Xid =') != -1:
+                        self.dml_tran(bline)
+                        bline=''
+                    else:
+                        bline = ''
+
+                    if bline.rstrip('\n') != '':
+                        self.dml_sql = self.dml_sql + bline + ' '
+        except Exception:
+            return 'function do error'
+
+    def esc_code(self,sql):
+        esc={
+             '\\x07':'\a','\\x08':'\b','\\x0c':'\f','\\x0a':'\n','\\x0d':'\r','\\x09':'\t','\\x0b':'\v','\\x5c':'\\',
+            #'\\x27':'\'',
+            '\\x22':'\"','\\x3f':'\?','\\x00':'\0'
+             }
+
+        for k,v in esc.items():
+            sql=sql.replace(k,v)
+        return sql
+
+    def binlogdesc(self):
+
+        countsql='select sqltype , count(*) numbers from {} group by sqltype order by sqltype '.format(self.tbevent)
+        print(countsql)
+        self.cur.execute(countsql)
+        count_row=self.cur.fetchall()
+
+        update_count=0
+        insert_couont=0
+        delete_count=0
+        for row in count_row:
+            if row['sqltype']==1:
+                insert_couont=row['numbers']
+            elif row['sqltype']==2:
+                update_count=row['numbers']
+            elif row['sqltype']==3:
+                delete_count=row['numbers']
+        logging.info('\033[1;35mTotal transactions number is {}: {} inserts, {} updates, {} deletes !\033[0m(all number is accurate, the other is approximate value) \033[0m'.format(insert_couont+update_count+delete_count,insert_couont,update_count,delete_count))
+
+    def undosql(self,number):
+        #这里会有几个问题：
+        #1 如果一共有几十万甚至更多的事务操作，那么这个python脚本，极为占用内存，有可能执行错误；
+        #2 如果单个事务中，涉及修改的行数高达几十万行，其binlog file 达好几G，这里也会有内存损耗问题；
+        #所以，针对第一点，这里考虑对超多事务进行一个分批执行处理，每个批次处理number个事务，避免一次性把所有事务放到python中；但是第2点，目前暂未处理
+
+        tran_num=1
+        id=0
+
+        tran_num_sql="select count(*) table_rows from {}".format(self.tbevent)
+
+        self.cur.execute(tran_num_sql)
+        tran_rows=self.cur.fetchall()
+
+        for num in tran_rows:
+            tran_num=num['table_rows']
+
+        logging.info('\033[32mThere has {} transactions ,need {} batchs ,each batche doing {} transactions \033[0m'.format(tran_num,int(tran_num/number)+1,number))
+
+        while id<=tran_num:
+            logging.info('doing batch : {} '.format(int(id/number)+1))
+            undo_sql='select auto_id,undo_sql from {} where auto_id > {} and auto_id <= {} order by auto_id desc;'.format(self.tbevent,tran_num-(id+number),tran_num-id)
+            self.cur.execute(undo_sql)
+
+            undo_rows=self.cur.fetchall()
+            for u_row in undo_rows:
+                try:
+                    self.on_cur.execute(u_row['undo_sql'])
+                    self.on_mysqlconn.commit()
+                except Exception:
+                    print('auto_id',u_row['auto_id'])
+                #time.sleep(2)
+            id+=number
+
+
+    def undo_file(self,number):
+        # 也可以选择私用undo_file将undo_sql导入到文件中,然后再source
+
+        tran_num=1
+        id=0
+
+        tran_num_sql="select count(*) table_rows from {}".format(self.tbevent)
+
+        self.cur.execute(tran_num_sql)
+        tran_rows=self.cur.fetchall()
+
+        for num in tran_rows:
+            tran_num=num['table_rows']
+
+        logging.info('copy undo_sql to undo file on : /tmp/flashback_undosql/undo_file_flashback.sql')
+        logging.info('\033[32mThere has {} transactions ,need {} batchs to copy ,each batche doing {} transactions \033[0m'.format(tran_num,int(tran_num/number)+1,number))
+
+        with open('/tmp/flashback_undosql/undo_file_flashback.sql', 'w') as w_f:
+            while id<=tran_num:
+                logging.info('doing batch : {} '.format(int(id/number)+1))
+                undo_sql='select auto_id,undo_sql from {} where auto_id > {} and auto_id <= {} order by auto_id desc;'.format(self.tbevent,tran_num-(id+number),tran_num-id)
+                self.cur.execute(undo_sql)
+
+                undo_rows=self.cur.fetchall()
+                for u_row in undo_rows:
+                    try:
+                        w_f.write('begin;' + '\n')
+                        w_f.write('# auto_id'+str(u_row['auto_id']) + '\n')
+                        w_f.write(u_row['undo_sql'] + '\n')
+                        w_f.write('commit;' + '\n')
+                    except Exception:
+                        print('auto_id',u_row['auto_id'])
+                    #time.sleep(2)
+                id+=number
+
+    def do(self):
+        if self.action=='0':
+            self.analyse_binlog()
+            logging.info('\033[36mfinished to analyze the binlog file !!!\033[0m')
+            #self.binlogdesc()
+        elif self.action=='1':
+            self.undosql(5000)
+
+    def closeconn(self):
+        self.cur.close()
+        self.on_cur.close()
+        logging.info('release all db connections')
+        logging.info('\033[33mAll done,check the {} which stored binlog event on host {} , port {} \033[0m'.format(self.tbevent,self.host,self.port))
+
+def main():
+    p = flashback()
+    p.do()
+    p.closeconn()
+
+if __name__ == "__main__":
+    main()
