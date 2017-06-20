@@ -17,24 +17,41 @@ logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(levelname)s %(mess
 import pymysql
 from pymysql.cursors import DictCursor
 
-usage=''' usage: python [script's path] [option]
+usage='''\nusage: python [script's path] [option]
 ALL options need to assign:
-
+\033[1;33;40m
 -h    : host, the database host，which database will store the results after analysis
 -u    : user, the db user
 -p    : password, the db user's password
 -P    : port, the db port
+
 -f    : file path, the binlog file
--t    : table name, the table name to store the results after analysis , {dbname}.{tbname},when you want to store in `test` db and the table name is `tbevent`,then this parameter is test.tbevent
-
--oh    : online host, the database host，which database have the online table schema
--ou    : online user, the db user
--op    : online password, the db user's password
--oP    : online port, the db port
-
--a    : action, 0 just analyse the binlog file ,and store sql in table;1 after execute self.dotype=0, execute the undo_sql in the table
+-t    : table name, the table name to store the results after analysis , {dbname}.{tbname},
+        when you want to store in `test` db and the table name is `tbevent`,then this parameter 
+        is test.tbevent
+\033[1;34;40m
+-oh   : online host, the database host，which database have the online table schema
+-ou   : online user, the db user
+-op   : online password, the db user's password
+-oP   : online port, the db port
+\033[1;32;40m
+-a    : action, 
+        0 just analyse the binlog file ,and store sql in table; 
+        1 after execute self.dotype=0, execute the undo_sql in the table
+\033[0m  
+--help: help document
+\033[1;35;40m
 Example:
+analysize binlog:
+python su_flashback.py -h=127.0.0.1 -P=3310 -u=root -p=*** -f=/tmp/binlog.log -t=flashback.tbevent 
+                       -oh=192.168.9.244 -oP=3310 -u=root -op=*** 
+                       -a=0
 
+flash back:
+python su_flashback.py -h=127.0.0.1 -P=3310 -u=root -p=*** -f=/tmp/binlog.log -t=flashback.tbevent 
+                       -oh=192.168.9.244 -oP=3310 -u=root -op=*** 
+                       -a=1
+\033[0m                        
 '''
 
 class flashback:
@@ -77,7 +94,6 @@ class flashback:
         self.tbfield_set = []
 
         self.begin_time=''
-        self.start_pos=''
         self.db_name=''
         self.tb_name=''
         self.end_time=''
@@ -133,7 +149,6 @@ class flashback:
             binlog_name VARCHAR(100) NOT NULL COMMENT 'the binlog file path and name',
             dml_start_time DATETIME NOT NULL COMMENT 'when to start this transaction ',
             dml_end_time DATETIME NOT NULL COMMENT 'when to finish this transaction ',
-            start_log_pos BIGINT NOT NULL COMMENT 'the log position for start this transaction',
             end_log_pos BIGINT NOT NULL COMMENT 'the log position for finish this transaction',
             db_name VARCHAR(100) NOT NULL COMMENT 'which database happened this transaction ',
             table_name VARCHAR(200) NOT NULL COMMENT 'which table happened this transaction ',
@@ -144,7 +159,6 @@ class flashback:
             INDEX sqltype(sqltype),
             INDEX dml_start_time (dml_start_time),
             INDEX dml_end_time (dml_end_time),
-            INDEX start_log_pos (start_log_pos),
             INDEX end_log_pos (end_log_pos),
             INDEX db_name (db_name),
             INDEX table_name (table_name)
@@ -187,7 +201,6 @@ class flashback:
                 begin_time = bl_line[:l:].rstrip(' ').replace('#', '20')
 
                 self.begin_time = begin_time[0:4] + '-' + begin_time[4:6] + '-' + begin_time[6:]
-                self.start_pos = int(bl_line[m::].split(' ')[1])
                 self.db_name = bl_line[n::].split(' ')[1].replace('`', '').split('.')[0]
                 self.tb_name = bl_line[n::].split(' ')[1].replace('`', '').split('.')[1]
 
@@ -196,7 +209,7 @@ class flashback:
             return 'funtion rowrecord error'
 
     def dml_tran(self,bl_line):
-        #try:
+        try:
 
 
             if bl_line.find('Xid =') != -1:
@@ -242,16 +255,17 @@ class flashback:
                 self.dml_sql = self.dml_sql.replace("'", "''").replace('\\x27',"''''")  # + ';'
                 self.undo_sql = self.undo_sql.replace("'", "''").replace('\\x27',"''''")  # + ';'
 
-                if len(self.dml_sql)>2000000:
+                if len(self.dml_sql)>500000000:
                     with open('/tmp/flashback_undosql/'+str(self.end_pos)+'.sql', 'w') as w_f:
-                        w_f.write('begin' + '\n')
+                        w_f.write('begin;' + '\n')
                         w_f.write(self.undo_sql)
-                        w_f.write('commit' + '\n')
+                        w_f.write('commit;' + '\n')
                     self.dml_sql=''
-                    self.undo_sql='source /tmp/flashback_undosql/'+str(self.end_pos)+'.sql'
+                    self.undo_sql='/tmp/flashback_undosql/'+str(self.end_pos)+'.sql'
+                    logging.info("the size of this transaction is more than 500Mb ,the file location : {}".format(self.undo_file))
 
-                insert_sql = "INSERT INTO {}(binlog_name,dml_start_time,dml_end_time,start_log_pos,end_log_pos,db_name,table_name,sqltype,dml_sql,undo_sql) select  '{}','{}','{}','{}','{}','{}','{}',{},'{}','{}'".format(
-                    self.tbevent, self.fpath, self.begin_time, self.end_time, self.start_pos, self.end_pos,
+                insert_sql = "INSERT INTO {}(binlog_name,dml_start_time,dml_end_time,end_log_pos,db_name,table_name,sqltype,dml_sql,undo_sql) select  '{}','{}','{}','{}','{}','{}',{},'{}','{}'".format(
+                    self.tbevent, self.fpath, self.begin_time, self.end_time, self.end_pos,
                     self.db_name, self.tb_name, self.sqltype, self.dml_sql, self.undo_sql)
 
                 self.cur.execute(insert_sql)
@@ -259,11 +273,9 @@ class flashback:
 
                 self.dml_sql = ''
                 self.undo_sql = ''
-        #except Exception:
-        #    print(self.start_pos,self.end_pos)
-        #    print(self.undo_sql)
-        #    print( 'funtion dml_tran error')
-        #    return
+        except Exception:
+            print( 'funtion dml_tran error')
+
 
     def analyse_binlog(self):
         try:
@@ -371,13 +383,14 @@ class flashback:
             self.cur.execute(undo_sql)
 
             undo_rows=self.cur.fetchall()
+            f_sql=''
+
             for u_row in undo_rows:
                 try:
                     self.on_cur.execute(u_row['undo_sql'])
                     self.on_mysqlconn.commit()
                 except Exception:
-                    print('auto_id',u_row['auto_id'])
-                #time.sleep(2)
+                    print('auto_id:',u_row['auto_id'])
             id+=number
 
 
@@ -422,7 +435,7 @@ class flashback:
             logging.info('\033[36mfinished to analyze the binlog file !!!\033[0m')
             #self.binlogdesc()
         elif self.action=='1':
-            self.undosql(5000)
+            self.undosql(10000)
 
     def closeconn(self):
         self.cur.close()
